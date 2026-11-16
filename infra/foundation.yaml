@@ -1,0 +1,227 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SIS 3 - Foundation infrastructure for order processing
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+
+Resources:
+
+  # ECR Repository for Docker images
+  OrdersRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}-orders-api'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the latest 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # SNS Topic for domain events
+  OrdersTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-orders-topic'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Dead Letter Queue
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-orders-dlq'
+      SqsManagedSseEnabled: true
+
+  # Main SQS Queue
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-orders-queue'
+      VisibilityTimeout: 60
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+  # Allow SNS to send messages to SQS
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrdersQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrdersTopic
+
+  # SNS subscription to SQS
+  OrdersSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: OrdersQueuePolicy
+    Properties:
+      TopicArn: !Ref OrdersTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true
+
+  # DynamoDB table for idempotency
+  ProcessedEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-processed-events'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Execution Role
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrderProcessingPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref OrdersTopic
+
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt OrdersQueue.Arn
+
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ProcessedEventsTable.Arn
+
+  # CloudWatch Log Group
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}'
+      RetentionInDays: 14
+
+Outputs:
+
+  OrdersRepositoryUri:
+    Description: ECR Repository URI
+    Value: !GetAtt OrdersRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersRepositoryUri'
+
+  OrdersTopicArn:
+    Description: SNS Topic ARN
+    Value: !Ref OrdersTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTopicArn'
+
+  OrdersQueueUrl:
+    Description: SQS Queue URL
+    Value: !Ref OrdersQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersQueueUrl'
+
+  OrdersQueueArn:
+    Description: SQS Queue ARN
+    Value: !GetAtt OrdersQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersQueueArn'
+
+  OrdersDLQUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref OrdersDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersDLQUrl'
+
+  ProcessedEventsTableName:
+    Description: DynamoDB table name
+    Value: !Ref ProcessedEventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedEventsTable'
+
+  ECSTaskRoleArn:
+    Description: ECS Task Role ARN
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskRoleArn'
+
+  ECSExecutionRoleArn:
+    Description: ECS Execution Role ARN
+    Value: !GetAtt ECSExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSExecutionRoleArn'
+
+  ApplicationLogGroupName:
+    Description: CloudWatch Log Group
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLogGroupName'
+
+

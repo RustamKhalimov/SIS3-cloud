@@ -1,0 +1,314 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SIS 3 - ECS Fargate API and SQS Worker behind AWS infrastructure
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+
+  FoundationStackName:
+    Type: String
+    Description: Name of the deployed foundation CloudFormation stack
+
+  ImageTag:
+    Type: String
+    Description: Immutable Docker image tag in ECR
+
+Resources:
+
+  # VPC
+  ApplicationVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet 1
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+
+  # Public Subnet 2
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ApplicationVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate Subnets with Route Table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group for ALB
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic to the load balancer
+      VpcId: !Ref ApplicationVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for ECS Tasks
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS tasks
+      VpcId: !Ref ApplicationVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+
+  # Target Group
+  ApplicationTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref ApplicationVPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: '200'
+
+  # ALB Listener
+  ApplicationListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApplicationTargetGroup
+
+  # ECS Cluster
+  ApplicationCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+
+  # ECS Task Definition - API
+  ApplicationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-api'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          !Sub '${FoundationStackName}-ECSExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          !Sub '${FoundationStackName}-ECSTaskRoleArn'
+      ContainerDefinitions:
+        - Name: orders-api
+          Image: !Sub
+            - '${RepositoryUri}:${Tag}'
+            - RepositoryUri:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-OrdersRepositoryUri'
+              Tag: !Ref ImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '8080'
+            - Name: SNS_TOPIC_ARN
+              Value:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-OrdersTopicArn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-ApplicationLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders-api
+
+  # ECS Fargate Service - API
+  ApplicationService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ApplicationListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-service'
+      Cluster: !Ref ApplicationCluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref ApplicationTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ApplicationSecurityGroup
+      LoadBalancers:
+        - ContainerName: orders-api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref ApplicationTargetGroup
+
+  # ECS Task Definition - SQS Worker
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-worker'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          !Sub '${FoundationStackName}-ECSExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue:
+          !Sub '${FoundationStackName}-ECSTaskRoleArn'
+      ContainerDefinitions:
+        - Name: orders-worker
+          Image: !Sub
+            - '${RepositoryUri}:${Tag}'
+            - RepositoryUri:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-OrdersRepositoryUri'
+              Tag: !Ref ImageTag
+          Essential: true
+          Command:
+            - node
+            - worker.js
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_QUEUE_URL
+              Value:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-OrdersQueueUrl'
+            - Name: DYNAMODB_TABLE_NAME
+              Value:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-ProcessedEventsTable'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue:
+                  !Sub '${FoundationStackName}-ApplicationLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders-worker
+
+  # ECS Fargate Service - SQS Worker
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-worker-service'
+      Cluster: !Ref ApplicationCluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref WorkerTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ApplicationSecurityGroup
+
+Outputs:
+
+  LoadBalancerDNS:
+    Description: Public URL of the API
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ECSClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ApplicationCluster
+
+  ECSServiceName:
+    Description: ECS API Service name
+    Value: !GetAtt ApplicationService.Name
+
+  ECSWorkerServiceName:
+    Description: ECS Worker Service name
+    Value: !GetAtt WorkerService.Name
