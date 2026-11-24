@@ -225,3 +225,4 @@ Outputs:
     Value: !Ref ApplicationLogGroup
     Export:
       Name: !Sub '${AWS::StackName}-ApplicationLogGroupName'
+
