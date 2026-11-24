@@ -3,30 +3,29 @@ name: Practice 7 - CI/CD
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
   id-token: write
 
+env:
+  AWS_REGION: eu-central-1
+  AWS_ACCOUNT_ID: "358103606111"
+  ECR_REPOSITORY: sis3-foundation-orders-api
+  ECS_CLUSTER: sis3-app-cluster
+  IMAGE_TAG: ${{ github.sha }}
+
 jobs:
   test:
+    name: CI - Test Application
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Show AWS trust subject
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const token = await core.getIDToken('sts.amazonaws.com')
-            const claims = JSON.parse(
-              Buffer.from(token.split('.')[1], 'base64url')
-            )
-            core.info(`sub = ${claims.sub}`)
-            core.info(`aud = ${claims.aud}`)
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -39,3 +38,112 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  deploy:
+    name: CD - Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: test
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::358103606111:role/GitHubActions-Deploy-SIS3
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Register API Task Definition
+        env:
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition sis3-app-api \
+            --query taskDefinition \
+            --output json > api-task.json
+
+          jq --arg IMAGE "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == "orders-api" then .image = $IMAGE else . end
+            )
+            | del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )
+          ' api-task.json > api-task-new.json
+
+          API_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://api-task-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service sis3-app-service \
+            --task-definition "$API_TASK_ARN"
+
+      - name: Register Worker Task Definition
+        env:
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition sis3-app-worker \
+            --query taskDefinition \
+            --output json > worker-task.json
+
+          jq --arg IMAGE "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == "orders-worker" then .image = $IMAGE else . end
+            )
+            | del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )
+          ' worker-task.json > worker-task-new.json
+
+          WORKER_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://worker-task-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service sis3-app-worker-service \
+            --task-definition "$WORKER_TASK_ARN"
+
+      - name: Wait for ECS Deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services sis3-app-service sis3-app-worker-service
+
+      - name: Deployment completed
+        run: echo "SIS3 CI/CD deployment completed successfully!"
