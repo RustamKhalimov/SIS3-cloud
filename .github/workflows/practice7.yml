@@ -16,7 +16,7 @@ env:
   AWS_ACCOUNT_ID: "358103606111"
   ECR_REPOSITORY: sis3-foundation-orders-api
   ECS_CLUSTER: sis3-app-cluster
-  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   test:
